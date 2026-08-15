@@ -8,6 +8,11 @@ name: build unix arm64 (manual)
 # untested until you've tried it.
 on:
   workflow_dispatch:
+    inputs:
+      perf:
+        description: "Compile in MTLD3D_PERF telemetry (cfg(perf_tracking))"
+        type: boolean
+        default: false
 
 jobs:
   build:
@@ -25,6 +30,8 @@ jobs:
         run: rustup target add aarch64-apple-darwin
 
       - name: Build mtld3d.so (production profile)
+        env:
+          MTLD3D_PERF: ${{ inputs.perf && '1' || '0' }}
         run: |
           cd unix
           cargo build --profile production --target aarch64-apple-darwin
