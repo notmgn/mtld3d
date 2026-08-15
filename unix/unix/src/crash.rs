@@ -169,6 +169,14 @@ extern "C" fn handler(signo: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut 
     // saved registers + top-of-stack name the culprit: `rcx` is the Win64 first
     // argument (a COM call's `this` — the freed object), `rax` the loaded vtable,
     // and the return address the faulting `CALL` pushed at `[rsp]` is the caller.
+    // x86_64-only: this reads the GUEST's x86 registers directly out of the
+    // unix `.so`'s own mcontext, which only holds because under Rosetta the
+    // `.so`'s native x86_64 registers ARE the guest's registers at the fault
+    // point. Under an aarch64 `.so` (FEX-based bottles, see issue #4) the guest
+    // is still x86 code that FEX emulates, so the host's aarch64 registers
+    // here are not the guest's — there is no direct mapping to port without
+    // reading FEX's own emulated register state, which this handler has no
+    // access to.
     #[cfg(target_arch = "x86_64")]
     {
         let rsp = mcontext_u64(ctx, 72);
@@ -235,19 +243,39 @@ extern "C" fn handler(signo: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut 
     // stack for words that `dladdr` resolves into *our* dylib and symbolise
     // them. This reconstructs the call chain the frame-pointer walk can't —
     // the return addresses pushed by the calls leading to the bad jump are
-    // still on the stack even when `rbp` is garbage. Done last because an
-    // unmapped read re-faults into the re-entrancy guard (`_exit`), which would
-    // otherwise drop the crumb dump + native backtrace above.
-    #[cfg(target_arch = "x86_64")]
+    // still on the stack even when the frame-pointer register is garbage.
+    // Done last because an unmapped read re-faults into the re-entrancy guard
+    // (`_exit`), which would otherwise drop the crumb dump + native backtrace
+    // above. Portable across x86_64/aarch64 `.so` builds: unlike the guest
+    // register dump above, this walks the `.so`'s *own* native stack for its
+    // *own* return addresses, which holds regardless of what runs the guest.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     {
-        let rsp = mcontext_u64(ctx, 72);
-        if rsp != 0 {
+        #[cfg(target_arch = "x86_64")]
+        let sp = mcontext_u64(ctx, 72);
+        #[cfg(target_arch = "aarch64")]
+        let sp = mcontext_u64(ctx, 264);
+
+        if sp != 0 {
             const HDR: &[u8] = b"[mtld3d::unix] mtld3d.so return addrs on stack:\n";
             // SAFETY: write(2) on fd 2 is async-signal-safe.
             unsafe {
                 let _ = libc::write(2, HDR.as_ptr().cast::<c_void>(), HDR.len());
             }
-            scan_stack_for_our_frames(rsp);
+            scan_stack_for_our_frames(sp);
+        }
+    }
+
+    // The 32-bit x86 guest-PE stack scan is x86_64-only: it only finds guest
+    // return addresses because under Rosetta the guest's x86 stack and the
+    // `.so`'s native stack are the same physical memory. Under FEX (aarch64
+    // `.so`) the guest's emulated stack lives in FEX's own address space, not
+    // this thread's native stack, so there is nothing to scan for here.
+    #[cfg(target_arch = "x86_64")]
+    {
+        let rsp = mcontext_u64(ctx, 72);
+        if rsp != 0 {
+            scan_guest_stack_for_pe_frames(rsp);
         }
     }
 
@@ -258,18 +286,19 @@ extern "C" fn handler(signo: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut 
 
 /// Scan the raw stack for return addresses into our own dylib and print them.
 ///
-/// Walks up to 4096 words from `rsp` and `backtrace_symbols_fd`-prints each
+/// Walks up to 4096 words from `sp` and `backtrace_symbols_fd`-prints each
 /// value that `dladdr` resolves into a module whose path contains `mtld3d`.
 /// Caps the printed count so a deep stack can't flood. Async-signal-safe: only
 /// `dladdr` (no malloc on the resolve path here) + `backtrace_symbols_fd` + raw
-/// stack reads.
-#[cfg(target_arch = "x86_64")]
-fn scan_stack_for_our_frames(rsp: u64) {
-    let base = rsp as *const u64;
+/// stack reads. Portable across x86_64/aarch64 — this only ever inspects the
+/// `.so`'s own native stack, not guest memory.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn scan_stack_for_our_frames(sp: u64) {
+    let base = sp as *const u64;
     let mut printed = 0u32;
     let mut i = 0usize;
     while i < 4096 && printed < 48 {
-        // SAFETY: reads stack memory at increasing offsets from `rsp`; an
+        // SAFETY: reads stack memory at increasing offsets from `sp`; an
         // unmapped read re-faults into the re-entrancy guard (terminating),
         // which bounds the walk. `read_unaligned` tolerates a 4-byte-aligned
         // 32-bit stack.
@@ -283,13 +312,26 @@ fn scan_stack_for_our_frames(rsp: u64) {
         }
         i += 1;
     }
-    // Second pass: the 32-bit guest stack. `dladdr` can't see Wine's PE
-    // builtins (not dyld images), so collect raw 4-byte words that land in the
-    // PE-builtin zone [0x7A00_0000, 0x7C00_0000) (ntdll/user32/win32u/d3d9/…)
-    // or the guest EXE image [0x0040_0000, 0x0080_0000) — covering all of the
-    // guest client's `.text` (up to ~0x7ff000), not just the first page, so the
-    // real guest call chain (its 0x4xxxxx–0x7xxxxx return addresses) is shown,
-    // mapped to modules by their logged load bases.
+}
+
+/// Scan the unix `.so`'s native stack for 32-bit words that look like x86
+/// guest-PE return addresses, and print them.
+///
+/// `dladdr` can't see Wine's PE builtins (not dyld images), so this collects
+/// raw 4-byte words that land in the PE-builtin zone [0x7A00_0000,
+/// 0x7C00_0000) (ntdll/user32/win32u/d3d9/…) or the guest EXE image
+/// [0x0040_0000, 0x0080_0000) — covering all of the guest client's `.text`
+/// (up to ~0x7ff000), not just the first page, so the real guest call chain
+/// (its 0x4xxxxx–0x7xxxxx return addresses) is shown, mapped to modules by
+/// their logged load bases.
+///
+/// x86_64-only: this only finds anything because under Rosetta the guest's
+/// x86 stack and the `.so`'s native stack are the same physical memory. Under
+/// FEX the guest's emulated stack lives in FEX's own address space, not this
+/// thread's native stack.
+#[cfg(target_arch = "x86_64")]
+fn scan_guest_stack_for_pe_frames(rsp: u64) {
+    let base = rsp as *const u64;
     const GHDR: &[u8] = b"[mtld3d::unix] guest (PE) stack words:\n";
     // SAFETY: write(2) on fd 2 is async-signal-safe.
     unsafe {
@@ -298,8 +340,8 @@ fn scan_stack_for_our_frames(rsp: u64) {
     let mut gprinted = 0u32;
     let mut j = 0usize;
     while j < 4096 && gprinted < 64 {
-        // SAFETY: as the loop above — reads near `rsp`; an unmapped read
-        // re-faults into the re-entrancy guard, bounding the walk.
+        // SAFETY: reads stack memory at increasing offsets from `rsp`; an
+        // unmapped read re-faults into the re-entrancy guard, bounding the walk.
         let w = unsafe { base.cast::<u8>().add(j * 4).cast::<u32>().read_unaligned() };
         let in_builtin = (0x7A00_0000..0x7C00_0000).contains(&w);
         let in_exe = (0x0040_0000..0x0080_0000).contains(&w);
@@ -324,7 +366,7 @@ fn scan_stack_for_our_frames(rsp: u64) {
 /// The match is on a loaded image whose filename contains the bytes `mtld3d`.
 /// Filters stack garbage and libsystem/Wine/Metal frames down to our own call
 /// chain.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn dladdr_is_ours(addr: u64) -> bool {
     // SAFETY: zeroed `Dl_info` is a valid out-param for `dladdr`.
     let mut info: libc::Dl_info = unsafe { mem::zeroed() };
@@ -367,8 +409,9 @@ const FRAME_CAP: c_int = 64;
 /// `ucontext_t` (same on both macOS arches). The PC offset *within* the
 /// `mcontext` is arch-specific: `x86_64` `__rip` follows the 16-byte exception
 /// state + 16 thread-state `u64`s (144); `arm64` `__pc` follows the 16-byte
-/// exception state + 32 thread-state `u64`s (272). The shipped `.so` is
-/// `x86_64` under Wine.
+/// exception state + 32 thread-state `u64`s (272). The default shipped `.so`
+/// is `x86_64` under Wine/Rosetta; `ARM64=1 make bundle` produces the aarch64
+/// build for FEX-based bottles instead (see Makefile).
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 const fn fault_pc(ctx: *mut c_void) -> u64 {
     #[cfg(target_arch = "x86_64")]
@@ -404,11 +447,13 @@ const fn fault_pc(_ctx: *mut c_void) -> u64 {
 
 /// Read a `u64` at byte `offset` within the signal `ucontext`'s `mcontext`.
 ///
-/// That `mcontext` is the `x86_64` register file. Offsets follow
-/// `__darwin_mcontext64`: the 16-byte exception state then the thread-state
-/// registers — `rax` at 16, `rcx` at 32, `rsp` at 72, `rip` at 144. Returns 0
-/// if the context can't be read.
-#[cfg(target_arch = "x86_64")]
+/// Offsets follow `__darwin_mcontext64`, which starts with the 16-byte
+/// exception state, then the thread-state registers. On `x86_64`: `rax` at
+/// 16, `rcx` at 32, `rsp` at 72, `rip` at 144. On `arm64` (`__darwin_arm_
+/// thread_state64`, 29 `x` GPRs before `fp`/`lr`/`sp`/`pc`): `x0` at 16, `sp`
+/// at 264, `pc` at 272 (see `fault_pc`'s `PC_OFFSET`). Returns 0 if the
+/// context can't be read.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn mcontext_u64(ctx: *mut c_void, offset: usize) -> u64 {
     if ctx.is_null() {
         return 0;

@@ -28,9 +28,19 @@ endif
 
 PE_i386     := i686-pc-windows-msvc
 PE_x64      := x86_64-pc-windows-msvc
-# Release/Wine target: the unix `.so` must be x86_64 Mach-O (Wine's unix-call
-# boundary), so shipped artifacts are always built for x86_64.
+# Release/Wine target: the unix `.so` is x86_64 Mach-O under Rosetta-based
+# Wine setups (its unix-call boundary must match the guest, which is x86 PE).
+# ARM64=1 switches this to aarch64-apple-darwin instead, for bottles that run
+# the guest under FEX (native ARM64 unix side, no Rosetta) — see
+# https://github.com/athei/mtld3d/issues/4. Unvalidated: nobody has run the
+# resulting .so under FEX yet, this just makes the build possible.
+ifeq ($(ARM64),1)
+UNIX_RELEASE_TARGET := aarch64-apple-darwin
+UNIX_DIR             := aarch64-unix
+else
 UNIX_RELEASE_TARGET := x86_64-apple-darwin
+UNIX_DIR             := x86_64-unix
+endif
 # Native host target for unit tests + clippy — whatever this machine is
 # (aarch64-apple-darwin on Apple Silicon). Builds/runs without Rosetta.
 UNIX_NATIVE_TARGET  := $(shell rustc -vV | sed -n 's/^host: //p')
@@ -122,9 +132,9 @@ install: all
 		cp $(OUT_x64)/mtld3d.dll   $(OUT_x64)/mtld3d.pdb   $$dir/lib/wine/x86_64-windows/ ; \
 		cp $(OUT_x64)/d3d9.dll     $(OUT_x64)/d3d9.pdb     $$dir/lib/wine/x86_64-windows/ ; \
 		winebuild --builtin $$dir/lib/wine/x86_64-windows/d3d9.dll ; \
-		cp $(OUT_unix)/mtld3d.so            $$dir/lib/wine/x86_64-unix/ ; \
-		rm -rf $$dir/lib/wine/x86_64-unix/mtld3d.so.dSYM ; \
-		cp -R $(OUT_unix)/mtld3d.so.dSYM    $$dir/lib/wine/x86_64-unix/ ; \
+		cp $(OUT_unix)/mtld3d.so            $$dir/lib/wine/$(UNIX_DIR)/ ; \
+		rm -rf $$dir/lib/wine/$(UNIX_DIR)/mtld3d.so.dSYM ; \
+		cp -R $(OUT_unix)/mtld3d.so.dSYM    $$dir/lib/wine/$(UNIX_DIR)/ ; \
 		cp $(OUT_i386)/mtld3d.fake.dll      $$dir/lib/wine/i386-windows/ ; \
 		cp $(OUT_x64)/mtld3d.fake.dll       $$dir/lib/wine/x86_64-windows/ ; \
 	done
@@ -142,7 +152,7 @@ bundle: all
 	rm -rf $(BUNDLE_STAGE) $(BUNDLE_OUT) $(DEBUG_STAGE) $(DEBUG_OUT)
 	mkdir -p $(BUNDLE_STAGE)/wine/i386-windows
 	mkdir -p $(BUNDLE_STAGE)/wine/x86_64-windows
-	mkdir -p $(BUNDLE_STAGE)/wine/x86_64-unix
+	mkdir -p $(BUNDLE_STAGE)/wine/$(UNIX_DIR)
 	mkdir -p $(BUNDLE_STAGE)/native/i386-windows
 	mkdir -p $(BUNDLE_STAGE)/native/x86_64-windows
 	cp $(OUT_i386)/mtld3d.dll           $(BUNDLE_STAGE)/wine/i386-windows/
@@ -153,7 +163,7 @@ bundle: all
 	cp $(OUT_x64)/d3d9.dll              $(BUNDLE_STAGE)/wine/x86_64-windows/
 	winebuild --builtin $(BUNDLE_STAGE)/wine/i386-windows/d3d9.dll
 	winebuild --builtin $(BUNDLE_STAGE)/wine/x86_64-windows/d3d9.dll
-	cp $(OUT_unix)/mtld3d.so            $(BUNDLE_STAGE)/wine/x86_64-unix/
+	cp $(OUT_unix)/mtld3d.so            $(BUNDLE_STAGE)/wine/$(UNIX_DIR)/
 	cp $(OUT_i386)/d3d9.dll             $(BUNDLE_STAGE)/native/i386-windows/
 	cp $(OUT_x64)/d3d9.dll              $(BUNDLE_STAGE)/native/x86_64-windows/
 	cp $(CURDIR)/mtld3d.conf            $(BUNDLE_STAGE)/
@@ -165,14 +175,14 @@ bundle: all
 	# the two d3d9.dll flavors are one binary with one `.pdb`.
 	mkdir -p $(DEBUG_STAGE)/i386-windows
 	mkdir -p $(DEBUG_STAGE)/x86_64-windows
-	mkdir -p $(DEBUG_STAGE)/x86_64-unix
+	mkdir -p $(DEBUG_STAGE)/$(UNIX_DIR)
 	echo $(BUILD_ID)                    > $(DEBUG_STAGE)/BUILD
 	cp $(OUT_i386)/d3d9.pdb             $(DEBUG_STAGE)/i386-windows/
 	cp $(OUT_i386)/mtld3d.pdb           $(DEBUG_STAGE)/i386-windows/
 	cp $(OUT_x64)/d3d9.pdb              $(DEBUG_STAGE)/x86_64-windows/
 	cp $(OUT_x64)/mtld3d.pdb            $(DEBUG_STAGE)/x86_64-windows/
-	cp -R $(OUT_unix)/mtld3d.so.dSYM    $(DEBUG_STAGE)/x86_64-unix/
-	tar -cJf $(DEBUG_OUT) -C $(DEBUG_STAGE) BUILD i386-windows x86_64-windows x86_64-unix
+	cp -R $(OUT_unix)/mtld3d.so.dSYM    $(DEBUG_STAGE)/$(UNIX_DIR)/
+	tar -cJf $(DEBUG_OUT) -C $(DEBUG_STAGE) BUILD i386-windows x86_64-windows $(UNIX_DIR)
 
 # E2E test environment overrides (the global exports above target the game):
 #   - shaderCache.enable=false  — parallel test processes mustn't race the cache.
@@ -311,7 +321,7 @@ setup:
 	brew install llvm lld
 	brew upgrade llvm lld
 	@echo "==> rustup: add cross-compile targets"
-	rustup target add i686-pc-windows-msvc x86_64-pc-windows-msvc x86_64-apple-darwin
+	rustup target add i686-pc-windows-msvc x86_64-pc-windows-msvc x86_64-apple-darwin aarch64-apple-darwin
 	@echo "==> cargo: install/upgrade xwin and cargo-edit"
 	cargo install xwin cargo-edit
 	@echo "==> /opt/xwin: ensure user-writable"

@@ -16,6 +16,17 @@ rustflags = [
     "-C", "force-frame-pointers=yes",
 ]
 
+# `ARM64=1 make unix` target: a native-ARM64 unix `.so` for FEX-based bottles
+# (see Makefile's UNIX_RELEASE_TARGET), where the unix-call boundary is
+# genuinely aarch64 rather than x86_64-under-Rosetta. No x86 ISA flags — the
+# host vector unit and GPR feature set are whatever this Apple Silicon
+# generation provides via the default `apple-m1`-family baseline. Unvalidated:
+# built but not yet run under FEX.
+[target.aarch64-apple-darwin]
+rustflags = [
+    "-C", "force-frame-pointers=yes",
+]
+
 [env]
 MACOSX_DEPLOYMENT_TARGET = "15.0"
 # `-march=x86-64-v2` mirrors the rustflags `target-cpu=x86-64-v2` baseline so
@@ -26,3 +37,5 @@ MACOSX_DEPLOYMENT_TARGET = "15.0"
 # AVX-independent GPR bit-manipulation features (BMI1/BMI2/LZCNT).
 CFLAGS_x86_64-apple-darwin   = "-march=x86-64-v2 -mbmi -mbmi2 -mlzcnt -fno-omit-frame-pointer"
 CXXFLAGS_x86_64-apple-darwin = "-march=x86-64-v2 -mbmi -mbmi2 -mlzcnt -fno-omit-frame-pointer"
+CFLAGS_aarch64-apple-darwin   = "-fno-omit-frame-pointer"
+CXXFLAGS_aarch64-apple-darwin = "-fno-omit-frame-pointer"

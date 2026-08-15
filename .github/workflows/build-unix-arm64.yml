@@ -1,0 +1,35 @@
+name: build unix arm64 (manual)
+
+# Manual, unvalidated build of the aarch64 mtld3d.so for FEX-based CrossOver
+# bottles (see https://github.com/athei/mtld3d/issues/4). Builds only the
+# `unix` workspace for aarch64-apple-darwin — no Wine SDK / xwin / Windows PE
+# build involved, so this needs nothing beyond a macOS runner + Xcode CLT.
+# Nobody has run the resulting .so under FEX yet; treat the artifact as
+# untested until you've tried it.
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install aarch64-apple-darwin target
+        run: rustup target add aarch64-apple-darwin
+
+      - name: Build mtld3d.so (production profile)
+        run: |
+          cd unix
+          cargo build --profile production --target aarch64-apple-darwin
+
+      - name: Stage artifact
+        run: |
+          mkdir -p staged
+          cp unix/target/aarch64-apple-darwin/production/libmtld3d_unix.dylib staged/mtld3d.so
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mtld3d-so-aarch64
+          path: staged/mtld3d.so
+          retention-days: 14

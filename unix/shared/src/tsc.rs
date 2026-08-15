@@ -3,9 +3,11 @@
 //! Compiles to a single `rdtsc` instruction on both PE targets (i386 and
 //! `x86_64`), bypassing any Wine-side `QueryPerformanceCounter` translation.
 //! Under Rosetta 2 on Apple Silicon the instruction is trapped to the ARM
-//! generic timer; cost stays near-native (~10–30 cycles). Native host
-//! (aarch64) test/lint builds — which never ship — read `CNTVCT_EL0`
-//! directly instead of going through Rosetta.
+//! generic timer; cost stays near-native (~10–30 cycles). The `aarch64`
+//! branch reads `CNTVCT_EL0` directly instead of going through Rosetta —
+//! used by native host test/lint builds, and also by an `ARM64=1`-built
+//! unix `.so` (FEX-based bottles, no Rosetta involved), where it's the
+//! correct native counter rather than a substitute.
 //!
 //! Returns raw TSC cycles, not nanoseconds. TSC is invariant on Nehalem+
 //! so a single runtime calibration against `Instant` yields a
@@ -30,9 +32,10 @@ const LOG_TARGET: &str = "mtld3d::perf";
 /// Read the timestamp / cycle counter.
 ///
 /// Single-instruction primitive on the x86 PE targets (`rdtsc`); `#[inline]`
-/// lets a measurement bracket compile to a pair of reads in release. Native
-/// host (aarch64) test/lint builds read the ARM generic timer `CNTVCT_EL0`
-/// instead — shipped Wine code always runs an x86 path.
+/// lets a measurement bracket compile to a pair of reads in release. The
+/// `aarch64` branch reads the ARM generic timer `CNTVCT_EL0` instead — the
+/// default shipped unix `.so` is x86_64 (an x86 path via Rosetta), but an
+/// `ARM64=1` build ships this branch directly.
 #[inline]
 #[must_use]
 pub fn rdtsc() -> u64 {
